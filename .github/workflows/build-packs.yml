@@ -119,6 +119,7 @@ jobs:
             | tee /tmp/result.txt
 
           echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "zoom=$zoom" >> "$GITHUB_OUTPUT"
           echo "file=$out" >> "$GITHUB_OUTPUT"
           echo "bytes=$(grep '^bytes=' /tmp/result.txt | cut -d= -f2)" >> "$GITHUB_OUTPUT"
           echo "planet=$(grep '^planet=' /tmp/result.txt | cut -d= -f2-)" >> "$GITHUB_OUTPUT"
@@ -141,6 +142,7 @@ jobs:
           {
             "name": "${{ steps.cut.outputs.name }}",
             "bytes": ${{ steps.cut.outputs.bytes }},
+            "maxzoom": ${{ steps.cut.outputs.zoom }},
             "sha256": "${{ steps.cut.outputs.sha256 }}",
             "planet": "${{ steps.cut.outputs.planet }}",
             "url": "https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare.outputs.tag }}/${{ steps.cut.outputs.file }}"
