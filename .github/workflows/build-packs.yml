@@ -1,0 +1,202 @@
+name: Build map packs
+
+# Cuts state packs out of the Protomaps planet build and publishes them, so the
+# app can download one file instead of reconstructing a state from tens of
+# thousands of range requests.
+#
+# Measured on the app's own extractor: Oregon is 65,160 requests averaging
+# 8.2 KB — over twenty minutes of request overhead on a phone connection. That
+# work happens here now, once per rebuild rather than once per install, which is
+# also a large net reduction in traffic to somebody else's free server.
+#
+# Lives in this repo rather than in pl0xuee/griddown so the default GITHUB_TOKEN
+# can publish releases here. Running it from the app repo would have needed a
+# personal access token as a secret; this needs nothing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      states:
+        description: "Comma-separated state codes, or 'starter' for the bundled overview"
+        default: "DC,RI"
+        required: true
+      maxzoom:
+        description: "Maximum zoom (the app asks for 15)"
+        default: "15"
+        required: true
+
+# One build at a time. Two concurrent runs would race on the same release tag,
+# and both would be hammering the same public server.
+concurrency: build-packs
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Work out the tag and the matrix
+        id: plan
+        run: |
+          tag="packs-$(date -u +%Y%m%d)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          # "DC,RI" -> ["DC","RI"], for the matrix below.
+          matrix=$(printf '%s' "${{ inputs.states }}" \
+            | tr ',' '\n' | sed 's/[[:space:]]//g' | grep -v '^$' \
+            | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin]))')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "tag $tag, states $matrix"
+
+      - name: Create the release if it does not exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.plan.outputs.tag }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $tag already exists — adding to it"
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+              --title "Map packs $tag" \
+              --notes "Pre-built GridDown map packs. See packs.json for the manifest the app reads."
+          fi
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    strategy:
+      # One failure should not throw away the packs that did build — they are
+      # expensive, and a state can fail on its own for its own reasons.
+      fail-fast: false
+      # Four at a time: enough to keep the job moving, restrained enough not to
+      # point sixty-four concurrent connections at a free public server.
+      max-parallel: 4
+      matrix:
+        state: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Check out the app, for its extractor and state list
+        uses: actions/checkout@v5
+        with:
+          repository: pl0xuee/griddown
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev patchelf libglib2.0-dev
+
+      - name: Build the extractor
+        working-directory: src-tauri
+        run: cargo build --release --bin build-pack
+
+      - name: Cut the pack
+        id: cut
+        run: |
+          state="${{ matrix.state }}"
+          if [ "$state" = "starter" ]; then
+            # The whole US at low zoom, bundled in the app so a fresh install
+            # opens on a real map. ~11 MB at zoom 6.
+            args="-179,18,-66,72"
+            zoom=6
+            name="starter"
+          else
+            args="$state"
+            zoom="${{ inputs.maxzoom }}"
+            name="$state"
+          fi
+
+          out="$name.pmtiles"
+          ./src-tauri/target/release/build-pack "$args" public/states.json "$out" "$zoom" \
+            | tee /tmp/result.txt
+
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "file=$out" >> "$GITHUB_OUTPUT"
+          echo "bytes=$(grep '^bytes=' /tmp/result.txt | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+          echo "planet=$(grep '^planet=' /tmp/result.txt | cut -d= -f2-)" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum "$out" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish it
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ needs.prepare.outputs.tag }}" \
+            "${{ steps.cut.outputs.file }}" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+      # A fragment per pack rather than one shared file: matrix jobs cannot
+      # write to each other, so the manifest is assembled at the end from these.
+      - name: Record it for the manifest
+        run: |
+          mkdir -p fragments
+          cat > "fragments/${{ steps.cut.outputs.name }}.json" <<JSON
+          {
+            "name": "${{ steps.cut.outputs.name }}",
+            "bytes": ${{ steps.cut.outputs.bytes }},
+            "sha256": "${{ steps.cut.outputs.sha256 }}",
+            "planet": "${{ steps.cut.outputs.planet }}",
+            "url": "https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare.outputs.tag }}/${{ steps.cut.outputs.file }}"
+          }
+          JSON
+          cat "fragments/${{ steps.cut.outputs.name }}.json"
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: fragment-${{ steps.cut.outputs.name }}
+          path: fragments/
+
+  manifest:
+    needs: [prepare, build]
+    # Runs even if some states failed: a manifest listing what did build is more
+    # useful than none, and the app falls back to live extraction for the rest.
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          pattern: fragment-*
+          path: fragments
+          merge-multiple: true
+
+      - name: Assemble packs.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ needs.prepare.outputs.tag }}"
+
+          # Carry forward anything already published under this tag, so adding
+          # two states later does not drop the ones built this morning.
+          existing='{}'
+          if gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+               --pattern packs.json --output old.json 2>/dev/null; then
+            existing=$(python3 -c 'import json;print(json.dumps(json.load(open("old.json")).get("packs",{})))')
+            echo "merging with $(python3 -c 'import json;print(len(json.loads("""'"$existing"'""")))') existing packs"
+          fi
+
+          python3 - "$existing" <<'PY'
+          import json, os, sys, glob, datetime
+          packs = json.loads(sys.argv[1])
+          planet = None
+          for f in sorted(glob.glob("fragments/*.json")):
+              d = json.load(open(f))
+              planet = d.pop("planet", None) or planet
+              packs[d.pop("name")] = d
+          out = {
+              "planetBuild": planet,
+              "generated": datetime.datetime.now(datetime.timezone.utc)
+                  .strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "packs": packs,
+          }
+          json.dump(out, open("packs.json", "w"), indent=2, sort_keys=True)
+          print(json.dumps(out, indent=2)[:800])
+          PY
+
+          gh release upload "$tag" packs.json --repo "$GITHUB_REPOSITORY" --clobber
