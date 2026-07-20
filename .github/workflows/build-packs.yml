@@ -200,3 +200,5 @@ jobs:
           PY
 
           gh release upload "$tag" packs.json --repo "$GITHUB_REPOSITORY" --clobber
+
+# Packs are cut from a dated planet build; the manifest records which one.
