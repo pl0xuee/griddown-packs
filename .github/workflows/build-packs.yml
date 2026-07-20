@@ -110,8 +110,22 @@ jobs:
             name="starter"
           else
             args="$state"
-            zoom="${{ inputs.maxzoom }}"
             name="$state"
+            # A state may ask to be cut shallower than the run's zoom, and the
+            # app reads the same field from the same file — so the pack is cut
+            # at exactly the zoom the app will ask for, and the manifest's zoom
+            # check still means something. Alaska is the only one: at z15 it is
+            # 19.6 M tiles, fourteen times California, and does not fit in the
+            # six-hour job limit.
+            zoom=$(python3 -c "
+import json,sys
+want = int('${{ inputs.maxzoom }}')
+for e in json.load(open('public/states.json')):
+    if e['abbr'] == '$state':
+        print(min(e.get('maxzoom', want), want)); break
+else:
+    print(want)
+")
           fi
 
           out="$name.pmtiles"
