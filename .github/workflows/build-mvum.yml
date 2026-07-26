@@ -22,6 +22,11 @@ on:
         description: "Comma-separated state codes, or blank for all 52"
         required: false
         default: ""
+      force:
+        description: "Rebuild even if the Forest Service data has not changed"
+        type: boolean
+        required: false
+        default: false
   schedule:
     # Monthly. The upstream national file is recut rarely — the current one is
     # dated May 2025 — so anything more often re-publishes identical geometry.
@@ -47,9 +52,77 @@ jobs:
         with:
           repository: pl0xuee/griddown
 
+      # The schedule is a calendar, not a subscription: nothing upstream tells
+      # us when the Forest Service recuts the national files, and they are
+      # recut rarely — the current pair is dated May 2025. Without this the
+      # monthly run re-downloads 340 MB and republishes 272 MB of byte-identical
+      # geometry, every month, for a year.
+      - name: Has the upstream data actually changed?
+        id: check
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, sys, urllib.request
+
+          SOURCES = {
+              "road": "https://data.fs.usda.gov/geodata/edw/edw_resources/shp/S_USA.Road_MVUM.zip",
+              "trail": "https://data.fs.usda.gov/geodata/edw/edw_resources/shp/S_USA.Trail_MVUM.zip",
+          }
+
+          def head(url):
+              try:
+                  req = urllib.request.Request(url, method="HEAD")
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      return r.headers.get("Last-Modified", "")
+              except Exception:
+                  return ""
+
+          live = {k: head(u) for k, u in SOURCES.items()}
+          print(f"live={json.dumps(live)}", file=sys.stderr)
+
+          forced = os.environ.get("FORCE") == "true" or os.environ.get("ONLY", "").strip()
+          if forced:
+              print("build=true")
+              print("Forced, or a specific state list was given.", file=sys.stderr)
+              raise SystemExit
+
+          # What the currently published packs were cut from.
+          # Cache-busted: the release CDN serves a stale asset for ~20 minutes
+          # and ignores Cache-Control, so without this the check reads the
+          # PREVIOUS manifest and can decide the wrong way round.
+          import time
+          url = (f"https://github.com/{os.environ['GITHUB_REPOSITORY']}"
+                 f"/releases/download/mvum-latest/mvum.json?t={int(time.time())}")
+          try:
+              with urllib.request.urlopen(url, timeout=60) as r:
+                  published = json.load(r).get("upstream", {})
+          except Exception as e:
+              published = None
+              print(f"no published manifest ({e}) — building", file=sys.stderr)
+
+          # Unknown stamps mean "rebuild": a blank Last-Modified is the server
+          # declining to say, not proof that nothing moved.
+          if published and all(live.values()) and published == live:
+              print("build=false")
+              print("Unchanged since the published packs were cut.", file=sys.stderr)
+          else:
+              print("build=true")
+              print(f"Changed (published={published}) — rebuilding.", file=sys.stderr)
+          PY
+        env:
+          FORCE: ${{ inputs.force }}
+          ONLY: ${{ inputs.states }}
+
+      - name: Nothing to do
+        if: steps.check.outputs.build != 'true'
+        run: |
+          echo "The Forest Service has not recut the national files since the"
+          echo "published packs were built. Nothing downloaded, nothing republished."
+          echo "Run again with 'force' ticked to rebuild anyway."
+
       # No setup-python and no pip install: the builder is stdlib-only, so the
       # runner's own python3 is the entire toolchain.
       - name: Build the packs
+        if: steps.check.outputs.build == 'true'
         run: |
           python3 tools/build_mvum_packs.py \
             --out dist/mvum \
@@ -57,6 +130,7 @@ jobs:
             --base-url "https://github.com/${{ github.repository }}/releases/download/mvum-latest"
 
       - name: What came out
+        if: steps.check.outputs.build == 'true'
         run: |
           ls -la dist/mvum
           echo "--- manifest ---"
@@ -67,6 +141,7 @@ jobs:
       # show as forest roads that simply stop — and "no road here" is a thing
       # people act on.
       - name: Check every pack parses and matches its manifest
+        if: steps.check.outputs.build == 'true'
         run: |
           python3 - <<'PY'
           import hashlib, json, pathlib, sys
@@ -89,6 +164,7 @@ jobs:
           PY
 
       - name: Publish
+        if: steps.check.outputs.build == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
