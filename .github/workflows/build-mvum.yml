@@ -1,0 +1,111 @@
+name: Build MVUM packs
+
+# Cuts the Forest Service Motor Vehicle Use Map into per-state overlays and
+# publishes them, so the app can download forest roads as one file from here.
+#
+# The app used to read them live from apps.fs.usda.gov, one state at a time,
+# which made that one service the single point of failure for the feature — and
+# it currently answers 500 for its entire catalogue, so there is no way to get
+# forest roads at all. The same Enterprise Data Warehouse product is published a
+# second way, as national shapefiles on data.fs.usda.gov, on a host that is up.
+# The split happens here, once, instead of on a phone at the moment somebody
+# needs the map.
+#
+# Lives in this repo for the same reason build-packs.yml does: the default
+# GITHUB_TOKEN can publish releases here, and running it from the app repo would
+# have needed a personal access token as a secret. This needs nothing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      states:
+        description: "Comma-separated state codes, or blank for all 52"
+        required: false
+        default: ""
+  schedule:
+    # Monthly. The upstream national file is recut rarely — the current one is
+    # dated May 2025 — so anything more often re-publishes identical geometry.
+    - cron: "0 4 1 * *"
+
+# One at a time: two runs would race on the same release tag, and both would be
+# pulling 340 MB from the same public server.
+concurrency: build-mvum
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    # ~340 MB of downloads, a 2 GB uncompressed .dbf streamed twice, and a
+    # million records split across 52 bounding boxes.
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out the app, for its builder and state list
+        uses: actions/checkout@v5
+        with:
+          repository: pl0xuee/griddown
+
+      # No setup-python and no pip install: the builder is stdlib-only, so the
+      # runner's own python3 is the entire toolchain.
+      - name: Build the packs
+        run: |
+          python3 tools/build_mvum_packs.py \
+            --out dist/mvum \
+            ${{ inputs.states && format('--only {0}', inputs.states) || '' }} \
+            --base-url "https://github.com/${{ github.repository }}/releases/download/mvum-latest"
+
+      - name: What came out
+        run: |
+          ls -la dist/mvum
+          echo "--- manifest ---"
+          head -c 1500 dist/mvum/mvum.json
+
+      # Fails the run rather than publishing a manifest pointing at packs nobody
+      # can read. A truncated overlay still parses far enough to draw, and would
+      # show as forest roads that simply stop — and "no road here" is a thing
+      # people act on.
+      - name: Check every pack parses and matches its manifest
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, pathlib, sys
+          out = pathlib.Path("dist/mvum")
+          man = json.loads((out / "mvum.json").read_text())["states"]
+          if not man:
+              sys.exit("no packs were produced")
+          for abbr, meta in man.items():
+              raw = (out / f"{abbr}.geojson").read_bytes()
+              if len(raw) != meta["bytes"]:
+                  sys.exit(f"{abbr}: size {len(raw)} != manifest {meta['bytes']}")
+              if hashlib.sha256(raw).hexdigest() != meta["sha256"]:
+                  sys.exit(f"{abbr}: sha256 mismatch")
+              doc = json.loads(raw)
+              if doc.get("type") != "FeatureCollection" or not doc.get("features"):
+                  sys.exit(f"{abbr}: not a usable FeatureCollection")
+              if "gd_kind" not in doc["features"][0]["properties"]:
+                  sys.exit(f"{abbr}: features carry no gd_kind")
+              print(f"{abbr}: {len(doc['features']):,} features, {len(raw)/1e6:.1f} MB OK")
+          PY
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A fixed tag, replaced each run. The app asks for mvum-latest by
+          # name, so there is exactly one release to look at.
+          gh release delete mvum-latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+
+          # --latest=false is load-bearing. GitHub moves this repo's "Latest"
+          # pointer to whatever was published most recently, and the BASEMAP
+          # manifest is served from releases/latest/download/packs.json — so
+          # publishing this the ordinary way would make every map pack download
+          # 404 while this workflow went green and said nothing.
+          gh release create mvum-latest \
+            --repo "$GITHUB_REPOSITORY" \
+            --latest=false \
+            --title "MVUM packs" \
+            --notes "Per-state USDA Forest Service Motor Vehicle Use Map overlays, cut from the national shapefiles on data.fs.usda.gov. See mvum.json for the manifest the app reads.
+
+          Not every National Forest publishes to this dataset, it covers National Forest System land only, and \"open\" means legally designated open — never passable." \
+            dist/mvum/*
