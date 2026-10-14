@@ -24,31 +24,58 @@ on:
         description: "Maximum zoom (the app asks for 15)"
         default: "15"
         required: true
+      tag:
+        description: "Release to add to, e.g. packs-20261014 — blank for a new one dated today. For re-running failed states into an earlier run's release."
+        default: ""
+        required: false
 
 # One build at a time. Two concurrent runs would race on the same release tag,
 # and both would be hammering the same public server.
 concurrency: build-packs
 
+# Read-only unless a job says otherwise. Every job here does write — they all
+# touch the release — but saying so per job means a job added later starts
+# with nothing.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   prepare:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     outputs:
       tag: ${{ steps.plan.outputs.tag }}
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
+      # Inputs arrive through env, never pasted into the script: `${{ }}` is
+      # substituted into the shell source before it runs, so a state list with a
+      # quote in it would have been code.
       - name: Work out the tag and the matrix
         id: plan
+        env:
+          STATES: ${{ inputs.states }}
+          TAG: ${{ inputs.tag }}
         run: |
-          tag="packs-$(date -u +%Y%m%d)"
+          # A re-run of failed states used to have to happen on the same UTC
+          # day, because the tag is the date and a later run made a new release
+          # holding only the re-run states. Naming the release lets it add to
+          # the one that is missing them.
+          if [ -n "$TAG" ]; then
+            if ! printf '%s' "$TAG" | grep -Eq '^packs-[0-9]{8}$'; then
+              echo "::error::tag must look like packs-YYYYMMDD, got '$TAG'"; exit 1
+            fi
+            tag="$TAG"
+          else
+            tag="packs-$(date -u +%Y%m%d)"
+          fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-          # "DC,RI" -> ["DC","RI"], for the matrix below.
-          matrix=$(printf '%s' "${{ inputs.states }}" \
+          # "DC,RI" -> ["DC","RI"], for the matrix below. Codes only: anything
+          # else in the list is refused rather than carried into job names.
+          matrix=$(printf '%s' "$STATES" \
             | tr ',' '\n' | sed 's/[[:space:]]//g' | grep -v '^$' \
-            | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin]))')
+            | python3 -c 'import json,re,sys; s=[l.strip() for l in sys.stdin]; bad=[x for x in s if not re.fullmatch(r"[A-Z]{2}|starter",x)]; sys.exit(f"not a state code: {bad}") if bad else print(json.dumps(s))')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "tag $tag, states $matrix"
 
@@ -60,7 +87,15 @@ jobs:
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "release $tag already exists — adding to it"
           else
+            # --latest=false is load-bearing, as it is in build-mvum.yml. The app
+            # reads releases/latest/download/packs.json; created the ordinary
+            # way, this release became Latest the moment it existed, hours
+            # before it held a manifest, and every download in that window 404'd
+            # and fell back to slow live extraction. It is promoted by the
+            # manifest job once it is whole, and until then the previous release
+            # keeps serving.
             gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+              --latest=false \
               --title "Map packs $tag" \
               --notes "Pre-built GridDown map packs. See packs.json for the manifest the app reads."
           fi
@@ -68,6 +103,12 @@ jobs:
   build:
     needs: prepare
     runs-on: ubuntu-24.04
+    # Uploads its pack straight to the release: a state is up to 1.5 GB, and
+    # handing 24 GB through artifacts to a separate publishing job would double
+    # the transfer. The third-party actions below are pinned by SHA for that
+    # reason — they run beside a token that can write releases.
+    permissions:
+      contents: write
     strategy:
       # One failure should not throw away the packs that did build — they are
       # expensive, and a state can fail on its own for its own reasons.
@@ -78,13 +119,22 @@ jobs:
       matrix:
         state: ${{ fromJson(needs.prepare.outputs.matrix) }}
     steps:
+      # Pinned by commit, with the version beside it. A tag can be moved to
+      # different code after the fact; a commit cannot.
       - name: Check out the app, for its extractor and state list
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: pl0xuee/griddown
+          # The app repo is public and nothing here pushes to it, so there is
+          # no reason to leave a write token in .git/config for later steps.
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # rust-toolchain chooses the toolchain from the ref it is called by, so
+      # pinned to a commit it has to be told.
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable, 2026-10
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: src-tauri
 
@@ -100,8 +150,11 @@ jobs:
 
       - name: Cut the pack
         id: cut
+        env:
+          STATE: ${{ matrix.state }}
+          MAXZOOM: ${{ inputs.maxzoom }}
         run: |
-          state="${{ matrix.state }}"
+          state="$STATE"
           if [ "$state" = "starter" ]; then
             # The whole US at low zoom, bundled in the app so a fresh install
             # opens on a real map. ~11 MB at zoom 6.
@@ -117,7 +170,7 @@ jobs:
             # zoom check meaningful instead of forcing it to be relaxed. Alaska
             # is the only one: at z15 it is 19.6 M tiles, fourteen times
             # California, and does not fit in the six-hour job limit.
-            zoom=$(python3 -c "import json,sys; w=int(sys.argv[1]); m=[e.get('maxzoom',w) for e in json.load(open('public/states.json')) if e['abbr']==sys.argv[2]]; print(min(m[0],w) if m else w)" "${{ inputs.maxzoom }}" "$state")
+            zoom=$(python3 -c "import json,sys; w=int(sys.argv[1]); m=[e.get('maxzoom',w) for e in json.load(open('public/states.json')) if e['abbr']==sys.argv[2]]; print(min(m[0],w) if m else w)" "$MAXZOOM" "$state")
           fi
 
           out="$name.pmtiles"
@@ -156,7 +209,7 @@ jobs:
           JSON
           cat "fragments/${{ steps.cut.outputs.name }}.json"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fragment-${{ steps.cut.outputs.name }}
           path: fragments/
@@ -167,8 +220,10 @@ jobs:
     # useful than none, and the app falls back to live extraction for the rest.
     if: always()
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: fragment-*
           path: fragments
@@ -208,5 +263,25 @@ jobs:
           PY
 
           gh release upload "$tag" packs.json --repo "$GITHUB_REPOSITORY" --clobber
+
+      # Only now is this release something the app should be pointed at. The
+      # manifest above still runs when some states failed — it records what
+      # did build — but a release missing states is not promoted: the app would
+      # lose those states' packs and fall back to live extraction for them.
+      # Re-run the failed states with `tag` set to this release; that run's
+      # manifest job promotes it once nothing is missing.
+      - name: Make it the release the app reads
+        if: needs.build.result == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --latest
+
+      - name: Say why it was not promoted
+        if: needs.build.result != 'success'
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          echo "::warning::Some states failed, so $TAG was NOT made Latest — the app keeps reading the previous release. Re-run the failed states with tag=$TAG; that run promotes it."
 
 # Packs are cut from a dated planet build; the manifest records which one.
