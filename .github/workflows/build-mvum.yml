@@ -36,21 +36,27 @@ on:
 # pulling 340 MB from the same public server.
 concurrency: build-mvum
 
+# Read-only by default; the one job that publishes says so.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     # ~340 MB of downloads, a 2 GB uncompressed .dbf streamed twice, and a
     # million records split across 52 bounding boxes.
     timeout-minutes: 120
 
     steps:
       - name: Check out the app, for its builder and state list
-        uses: actions/checkout@v5
+        # Pinned by commit, with the version beside it: a tag can be moved.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: pl0xuee/griddown
+          # Nothing here pushes to the app repo; don't leave a token in .git/config.
+          persist-credentials: false
 
       # The schedule is a calendar, not a subscription: nothing upstream tells
       # us when the Forest Service recuts the national files, and they are
@@ -121,13 +127,20 @@ jobs:
 
       # No setup-python and no pip install: the builder is stdlib-only, so the
       # runner's own python3 is the entire toolchain.
+      # The state list reaches the script through env, not pasted into it:
+      # `${{ }}` is substituted into the shell source, so a quote in the input
+      # would have been code.
       - name: Build the packs
         if: steps.check.outputs.build == 'true'
+        env:
+          ONLY: ${{ inputs.states }}
         run: |
+          only=()
+          if [ -n "$ONLY" ]; then only=(--only "$ONLY"); fi
           python3 tools/build_mvum_packs.py \
             --out dist/mvum \
-            ${{ inputs.states && format('--only {0}', inputs.states) || '' }} \
-            --base-url "https://github.com/${{ github.repository }}/releases/download/mvum-latest"
+            "${only[@]}" \
+            --base-url "https://github.com/$GITHUB_REPOSITORY/releases/download/mvum-latest"
 
       - name: What came out
         if: steps.check.outputs.build == 'true'
